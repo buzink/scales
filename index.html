@@ -44,6 +44,9 @@ let scaleType = "UNKNOWN"; // OLD, NEW, GENERIC
 let heartbeatTimer;
 let lastPacketAt = 0;
 let timerRunning = false;
+let acaiaBuffer = new Uint8Array(0);
+let writeQueue = Promise.resolve();
+let writeInProgress = false;
 
 const statusEl = document.getElementById("status");
 const weightEl = document.getElementById("weight");
@@ -86,6 +89,123 @@ function setStatus(text) {
 
 function setWeight(value) {
   weightEl.textContent = value.toFixed(1) + " g";
+}
+
+function enqueueWrite(data) {
+  if (!writeChar) return Promise.resolve();
+  writeQueue = writeQueue
+    .then(async () => {
+      writeInProgress = true;
+      await writeChar.writeValue(data);
+    })
+    .catch(() => {})
+    .finally(() => {
+      writeInProgress = false;
+    });
+  return writeQueue;
+}
+
+function appendAcaiaBuffer(chunk) {
+  if (!chunk || chunk.length === 0) return;
+  const merged = new Uint8Array(acaiaBuffer.length + chunk.length);
+  merged.set(acaiaBuffer, 0);
+  merged.set(chunk, acaiaBuffer.length);
+  acaiaBuffer = merged;
+}
+
+function consumeAcaiaBuffer(startIndex) {
+  if (startIndex <= 0) return;
+  acaiaBuffer = acaiaBuffer.slice(startIndex);
+}
+
+function parseAcaiaMessages() {
+  let offset = 0;
+  while (offset < acaiaBuffer.length - 6) {
+    let start = -1;
+    for (let i = offset; i < acaiaBuffer.length - 1; i++) {
+      if (acaiaBuffer[i] === 0xef && acaiaBuffer[i + 1] === 0xdd) {
+        start = i;
+        break;
+      }
+    }
+
+    if (start < 0) {
+      acaiaBuffer = new Uint8Array(0);
+      return;
+    }
+
+    if (acaiaBuffer.length - start < 6) {
+      consumeAcaiaBuffer(start);
+      return;
+    }
+
+    const payloadLen = acaiaBuffer[start + 3];
+    const messageEnd = start + payloadLen + 5;
+    if (messageEnd > acaiaBuffer.length) {
+      consumeAcaiaBuffer(start);
+      return;
+    }
+
+    const cmd = acaiaBuffer[start + 2];
+    if (cmd === 0x0c) {
+      const msgType = acaiaBuffer[start + 4];
+      if (msgType === 0x08) {
+        const payload = acaiaBuffer.slice(start + 5, messageEnd);
+        if (payload.length >= 2) {
+          const p0 = payload[0];
+          const p1 = payload[1];
+          let matched = false;
+          if (p0 === 0x08 && p1 === 0x05) {
+            setTimerRunningState(true);
+            matched = true;
+          } else if (p0 === 0x0a && p1 === 0x07) {
+            setTimerRunningState(false);
+            matched = true;
+          } else if (p0 === 0x09 && p1 === 0x07) {
+            setTimerRunningState(false);
+            matched = true;
+          }
+
+          if (!matched && timerRunning) {
+            // Some Lunar firmware reports stop as unknown; mirror Beanconqueror fallback
+            setTimerRunningState(false);
+          }
+        }
+      }
+    }
+
+    offset = messageEnd;
+  }
+
+  if (offset > 0) {
+    consumeAcaiaBuffer(offset);
+  }
+}
+
+function setTimerRunningState(running) {
+  timerRunning = running;
+  timerBtn.textContent = timerRunning ? "Stop Timer" : "Start Timer";
+}
+
+function handleAcaiaTimerEvent(data) {
+  appendAcaiaBuffer(data);
+  parseAcaiaMessages();
+  return true;
+}
+
+function handleBookooTimerEvent(data) {
+  // Some Bookoo variants send button events as short frames
+  if (data.length >= 3 && data[0] === 0x03 && data[1] === 0x0a) {
+    if (data[2] === 0x04) {
+      setTimerRunningState(true);
+      return true;
+    }
+    if (data[2] === 0x05 || data[2] === 0x06) {
+      setTimerRunningState(false);
+      return true;
+    }
+  }
+  return false;
 }
 
 /* ---- Connect ---- */
@@ -191,8 +311,8 @@ async function setupGatt() {
   notifyChar.addEventListener("characteristicvaluechanged", onNotify);
 
   if (scaleType === "OLD" || scaleType === "NEW") {
-    await writeChar.writeValue(IDENTIFY);
-    await writeChar.writeValue(NOTIFICATION_REQUEST);
+    await enqueueWrite(IDENTIFY);
+    await enqueueWrite(NOTIFICATION_REQUEST);
     startHeartbeat();
   }
 
@@ -203,6 +323,12 @@ async function setupGatt() {
 function onNotify(event) {
   const data = new Uint8Array(event.target.value.buffer);
   const l = data.length;
+
+  if (scaleType === "OLD" || scaleType === "NEW") {
+    handleAcaiaTimerEvent(data);
+  } else if (scaleType === "GENERIC") {
+    handleBookooTimerEvent(data);
+  }
 
   let weight = null;
 
@@ -233,7 +359,7 @@ tareBtn.onclick = async () => {
   if (!writeChar) return;
 
   try {
-    await writeChar.writeValue(scaleType === "GENERIC" ? TARE_GENERIC : TARE_ACAIA);
+    await enqueueWrite(scaleType === "GENERIC" ? TARE_GENERIC : TARE_ACAIA);
   } catch (err) {
     console.warn("Tare failed", err);
   }
@@ -245,9 +371,9 @@ timerBtn.onclick = async () => {
 
   try {
     if (scaleType === "OLD" || scaleType === "NEW") {
-      await writeChar.writeValue(timerRunning ? STOP_TIMER_ACAIA : START_TIMER_ACAIA);
+      await enqueueWrite(timerRunning ? STOP_TIMER_ACAIA : START_TIMER_ACAIA);
     } else if (scaleType === "GENERIC") {
-      await writeChar.writeValue(timerRunning ? STOP_TIMER_BOOKOO : START_TIMER_BOOKOO);
+      await enqueueWrite(timerRunning ? STOP_TIMER_BOOKOO : START_TIMER_BOOKOO);
     } else {
       return;
     }
@@ -265,9 +391,9 @@ resetTimerBtn.onclick = async () => {
 
   try {
     if (scaleType === "OLD" || scaleType === "NEW") {
-      await writeChar.writeValue(RESET_TIMER_ACAIA);
+      await enqueueWrite(RESET_TIMER_ACAIA);
     } else if (scaleType === "GENERIC") {
-      await writeChar.writeValue(RESET_TIMER_BOOKOO);
+      await enqueueWrite(RESET_TIMER_BOOKOO);
     } else {
       return;
     }
@@ -295,12 +421,13 @@ function startHeartbeat() {
   stopHeartbeat();
   heartbeatTimer = setInterval(async () => {
     if (!writeChar || (scaleType !== "OLD" && scaleType !== "NEW")) return;
+    if (writeInProgress) return;
     if (lastPacketAt && Date.now() - lastPacketAt > MAX_PACKET_PERIOD_MS) {
       setStatus("No data (timeout)");
       return;
     }
     try {
-      await writeChar.writeValue(HEARTBEAT);
+      await enqueueWrite(HEARTBEAT);
     } catch (err) {
       console.warn("Heartbeat failed", err);
     }
