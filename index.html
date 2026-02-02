@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Bluetooth Scale MVP</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    padding: 20px;
+    max-width: 400px;
+  }
+  button {
+    margin: 5px 0;
+    padding: 8px 12px;
+  }
+  #weight {
+    font-size: 48px;
+    margin: 20px 0;
+  }
+  #status {
+    color: #666;
+    font-size: 14px;
+  }
+</style>
+</head>
+<body>
+
+<h2>Scale</h2>
+
+<button id="connect">Connect</button>
+<button id="tare" disabled>Tare</button>
+
+<div id="weight">--.- g</div>
+<div id="status">Disconnected</div>
+
+<script>
+let device;
+let server;
+let notifyChar;
+let writeChar;
+let scaleType = "UNKNOWN"; // OLD, NEW, GENERIC
+let heartbeatTimer;
+let lastPacketAt = 0;
+
+const statusEl = document.getElementById("status");
+const weightEl = document.getElementById("weight");
+const tareBtn = document.getElementById("tare");
+
+/* ---- Acaia/Bookoo UUIDs (Beanconqueror-compatible) ---- */
+const ACAIA_SERVICE_UUID = "00001820-0000-1000-8000-00805f9b34fb";
+const READ_CHAR_OLD_UUID = "00002a80-0000-1000-8000-00805f9b34fb";
+const WRITE_CHAR_OLD_UUID = "00002a80-0000-1000-8000-00805f9b34fb";
+const PYXIS_SERVICE_UUID = "49535343-fe7d-4ae5-8fa9-9fafd205e455";
+const READ_CHAR_NEW_UUID = "49535343-1e4d-4bd9-ba61-23c647249616";
+const WRITE_CHAR_NEW_UUID = "49535343-8841-43f4-a8d4-ecbe34729bb3";
+const READ_CHAR_GENERIC_UUID = "0000ff11-0000-1000-8000-00805f9b34fb";
+const WRITE_CHAR_GENERIC_UUID = "0000ff12-0000-1000-8000-00805f9b34fb";
+const BOOKOO_SERVICE_UUID = "00000ffe-0000-1000-8000-00805f9b34fb";
+const GENERIC_SERVICE_UUID = "0000ff10-0000-1000-8000-00805f9b34fb";
+
+const HEARTBEAT_PERIOD_MS = 2750;
+const MAX_PACKET_PERIOD_MS = 5000;
+
+/* ---- Commands (AcaiaArduinoBLE) ---- */
+const IDENTIFY = new Uint8Array([0xef,0xdd,0x0b,0x30,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x30,0x31,0x32,0x33,0x34,0x9a,0x6d]);
+const HEARTBEAT = new Uint8Array([0xef,0xdd,0x00,0x02,0x00,0x02,0x00]);
+const NOTIFICATION_REQUEST = new Uint8Array([0xef,0xdd,0x0c,0x09,0x00,0x01,0x01,0x02,0x02,0x05,0x03,0x04,0x15,0x06]);
+const TARE_ACAIA = new Uint8Array([0xef,0xdd,0x04,0x00,0x00,0x00]);
+const TARE_GENERIC = new Uint8Array([0x03,0x0a,0x01,0x00,0x00,0x08]);
+
+/* ---- UI helpers ---- */
+function setStatus(text) {
+  statusEl.textContent = text;
+}
+
+function setWeight(value) {
+  weightEl.textContent = value.toFixed(1) + " g";
+}
+
+/* ---- Connect ---- */
+document.getElementById("connect").onclick = async () => {
+  if (!navigator.bluetooth) {
+    alert("Web Bluetooth not supported");
+    return;
+  }
+
+  try {
+    setStatus("Requesting device...");
+
+    device = await navigator.bluetooth.requestDevice({
+      filters: [
+        { namePrefix: "ACAIA" },
+        { namePrefix: "Acaia" },
+        { namePrefix: "PEARL" },
+        { namePrefix: "Pearl" },
+        { namePrefix: "LUNAR" },
+        { namePrefix: "Lunar" },
+        { namePrefix: "BOOKOO" },
+        { namePrefix: "BOOKO" },
+        { namePrefix: "CINCO" },
+        { namePrefix: "PYXIS" },
+        { namePrefix: "PROCH" }
+      ],
+      optionalServices: [
+        ACAIA_SERVICE_UUID,
+        PYXIS_SERVICE_UUID,
+        BOOKOO_SERVICE_UUID,
+        GENERIC_SERVICE_UUID,
+        "00001800-0000-1000-8000-00805f9b34fb",
+        "00001801-0000-1000-8000-00805f9b34fb",
+        "0000180a-0000-1000-8000-00805f9b34fb",
+        "0000180f-0000-1000-8000-00805f9b34fb",
+      ]
+    });
+
+    device.addEventListener(
+      "gattserverdisconnected",
+      onDisconnected
+    );
+
+    server = await device.gatt.connect();
+    setStatus("Connected to " + device.name);
+
+    await setupGatt();
+    tareBtn.disabled = false;
+
+  } catch (err) {
+    console.error(err);
+    setStatus("Connection failed");
+  }
+};
+
+/* ---- GATT setup ---- */
+async function setupGatt() {
+  const services = await server.getPrimaryServices();
+
+  let oldChar = null;
+  let newReadChar = null;
+  let newWriteChar = null;
+  let genericReadChar = null;
+  let genericWriteChar = null;
+  for (const service of services) {
+    const chars = await service.getCharacteristics();
+    for (const char of chars) {
+      const uuid = char.uuid.toLowerCase();
+      if (uuid === READ_CHAR_OLD_UUID) {
+        oldChar = char;
+      } else if (uuid === READ_CHAR_NEW_UUID) {
+        newReadChar = char;
+      } else if (uuid === WRITE_CHAR_NEW_UUID) {
+        newWriteChar = char;
+      } else if (uuid === READ_CHAR_GENERIC_UUID) {
+        genericReadChar = char;
+      } else if (uuid === WRITE_CHAR_GENERIC_UUID) {
+        genericWriteChar = char;
+      }
+    }
+  }
+
+  if (newReadChar && newWriteChar) {
+    scaleType = "NEW";
+    notifyChar = newReadChar;
+    writeChar = newWriteChar;
+  } else if (oldChar) {
+    scaleType = "OLD";
+    notifyChar = oldChar;
+    writeChar = oldChar;
+  } else if (genericReadChar && genericWriteChar) {
+    scaleType = "GENERIC";
+    notifyChar = genericReadChar;
+    writeChar = genericWriteChar;
+  } else {
+    setStatus("No compatible Acaia/Bookoo characteristics found");
+    return;
+  }
+
+  await notifyChar.startNotifications();
+  notifyChar.addEventListener("characteristicvaluechanged", onNotify);
+
+  if (scaleType === "OLD" || scaleType === "NEW") {
+    await writeChar.writeValue(IDENTIFY);
+    await writeChar.writeValue(NOTIFICATION_REQUEST);
+    startHeartbeat();
+  }
+
+  setStatus(`Connected (${scaleType})`);
+}
+
+/* ---- Notification handler ---- */
+function onNotify(event) {
+  const data = new Uint8Array(event.target.value.buffer);
+  const l = data.length;
+
+  let weight = null;
+
+  if ((scaleType === "NEW") && (l === 13 || l === 17) && data[4] === 0x05) {
+    const raw = ((data[6] & 0xff) << 8) + (data[5] & 0xff);
+    const unit = data[9];
+    const sign = (data[10] & 0x02) ? -1 : 1;
+    weight = (raw / Math.pow(10, unit)) * sign;
+  } else if ((scaleType === "OLD") && (l === 10 || l === 14)) {
+    const raw = ((data[3] & 0xff) << 8) + (data[2] & 0xff);
+    const unit = data[6];
+    const sign = (data[7] & 0x02) ? -1 : 1;
+    weight = (raw / Math.pow(10, unit)) * sign;
+  } else if ((scaleType === "GENERIC") && l === 20) {
+    const raw = ((data[7] & 0xff) << 16) | ((data[8] & 0xff) << 8) | (data[9] & 0xff);
+    const sign = (data[6] === 45) ? -1 : 1;
+    weight = (raw / 100) * sign;
+  }
+
+  if (weight !== null && Number.isFinite(weight)) {
+    setWeight(weight);
+    lastPacketAt = Date.now();
+  }
+}
+
+/* ---- Tare ---- */
+tareBtn.onclick = async () => {
+  if (!writeChar) return;
+
+  try {
+    await writeChar.writeValue(scaleType === "GENERIC" ? TARE_GENERIC : TARE_ACAIA);
+  } catch (err) {
+    console.warn("Tare failed", err);
+  }
+};
+
+/* ---- Disconnect ---- */
+function onDisconnected() {
+  setStatus("Disconnected");
+  tareBtn.disabled = true;
+  weightEl.textContent = "--.- g";
+  stopHeartbeat();
+}
+
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(async () => {
+    if (!writeChar || (scaleType !== "OLD" && scaleType !== "NEW")) return;
+    if (lastPacketAt && Date.now() - lastPacketAt > MAX_PACKET_PERIOD_MS) {
+      setStatus("No data (timeout)");
+      return;
+    }
+    try {
+      await writeChar.writeValue(HEARTBEAT);
+    } catch (err) {
+      console.warn("Heartbeat failed", err);
+    }
+  }, HEARTBEAT_PERIOD_MS);
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+</script>
+
+</body>
+</html>
