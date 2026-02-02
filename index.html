@@ -92,9 +92,7 @@ document.getElementById("connect").onclick = async () => {
         { namePrefix: "ACAIA" },
         { namePrefix: "Acaia" },
         { namePrefix: "PEARL" },
-        { namePrefix: "Pearl" },
         { namePrefix: "LUNAR" },
-        { namePrefix: "Lunar" },
         { namePrefix: "BOOKOO" },
         { namePrefix: "BOOKO" },
         { namePrefix: "CINCO" },
@@ -183,7 +181,7 @@ async function setupGatt() {
     startHeartbeat();
   }
 
-  setStatus(`Connected (${scaleType})`);
+  setStatus(`Connected to ${device.name} (${scaleType})`);
 }
 
 /* ---- Notification handler ---- */
@@ -257,6 +255,6 @@ function stopHeartbeat() {
   }
 }
 </script>
-
+<p><a href="https://github.com/buzink/scales">GitHub Repository</a></p>
 </body>
 </html>
