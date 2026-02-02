@@ -1,0 +1,1 @@
+Vibe coded single page and single file web app in html and plain javascript without dependencies to test web interaction with coffee scales. Supports Acaia and Bookoo. Tested with Acaia Lunar. Based on code of [Bean conquerer](https://github.com/graphefruit/Beanconqueror) and [Pyacaia](https://github.com/lucapinello/pyacaia). 
