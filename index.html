@@ -29,6 +29,7 @@
 
 <button id="connect">Connect</button>
 <button id="tare" disabled>Tare</button>
+<button id="timer" disabled>Start Timer</button>
 
 <div id="weight">--.- g</div>
 <div id="status">Disconnected</div>
@@ -41,10 +42,12 @@ let writeChar;
 let scaleType = "UNKNOWN"; // OLD, NEW, GENERIC
 let heartbeatTimer;
 let lastPacketAt = 0;
+let timerRunning = false;
 
 const statusEl = document.getElementById("status");
 const weightEl = document.getElementById("weight");
 const tareBtn = document.getElementById("tare");
+const timerBtn = document.getElementById("timer");
 
 /* ---- Acaia/Bookoo UUIDs (Beanconqueror-compatible) ---- */
 const ACAIA_SERVICE_UUID = "00001820-0000-1000-8000-00805f9b34fb";
@@ -67,6 +70,10 @@ const HEARTBEAT = new Uint8Array([0xef,0xdd,0x00,0x02,0x00,0x02,0x00]);
 const NOTIFICATION_REQUEST = new Uint8Array([0xef,0xdd,0x0c,0x09,0x00,0x01,0x01,0x02,0x02,0x05,0x03,0x04,0x15,0x06]);
 const TARE_ACAIA = new Uint8Array([0xef,0xdd,0x04,0x00,0x00,0x00]);
 const TARE_GENERIC = new Uint8Array([0x03,0x0a,0x01,0x00,0x00,0x08]);
+const START_TIMER_ACAIA = new Uint8Array([0xef,0xdd,0x0d,0x00,0x00,0x00,0x00]);
+const STOP_TIMER_ACAIA = new Uint8Array([0xef,0xdd,0x0d,0x00,0x02,0x00,0x02]);
+const START_TIMER_BOOKOO = new Uint8Array([0x03,0x0a,0x04,0x00,0x00,0x0a]);
+const STOP_TIMER_BOOKOO = new Uint8Array([0x03,0x0a,0x05,0x00,0x00,0x0d]);
 
 /* ---- UI helpers ---- */
 function setStatus(text) {
@@ -121,6 +128,9 @@ document.getElementById("connect").onclick = async () => {
 
     await setupGatt();
     tareBtn.disabled = false;
+    timerBtn.disabled = false;
+    timerBtn.textContent = "Start Timer";
+    timerRunning = false;
 
   } catch (err) {
     console.error(err);
@@ -224,10 +234,33 @@ tareBtn.onclick = async () => {
   }
 };
 
+/* ---- Timer ---- */
+timerBtn.onclick = async () => {
+  if (!writeChar) return;
+
+  try {
+    if (scaleType === "OLD" || scaleType === "NEW") {
+      await writeChar.writeValue(timerRunning ? STOP_TIMER_ACAIA : START_TIMER_ACAIA);
+    } else if (scaleType === "GENERIC") {
+      await writeChar.writeValue(timerRunning ? STOP_TIMER_BOOKOO : START_TIMER_BOOKOO);
+    } else {
+      return;
+    }
+
+    timerRunning = !timerRunning;
+    timerBtn.textContent = timerRunning ? "Stop Timer" : "Start Timer";
+  } catch (err) {
+    console.warn("Timer command failed", err);
+  }
+};
+
 /* ---- Disconnect ---- */
 function onDisconnected() {
   setStatus("Disconnected");
   tareBtn.disabled = true;
+  timerBtn.disabled = true;
+  timerBtn.textContent = "Start Timer";
+  timerRunning = false;
   weightEl.textContent = "--.- g";
   stopHeartbeat();
 }
