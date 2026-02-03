@@ -58,6 +58,9 @@
 <label for="flowOutput">Flow capture (g/s, JSON)</label>
 <textarea id="flowOutput" rows="6" style="width: 100%; margin-top: 6px;" readonly></textarea>
 
+<label for="rawOutput">Raw notifications (JSON)</label>
+<textarea id="rawOutput" rows="6" style="width: 100%; margin-top: 6px;" readonly></textarea>
+
 <script>
 let device;
 let server;
@@ -85,6 +88,8 @@ let flowCapture = {
   samples: [],
 };
 let flowPrevWeight = null;
+let rawSamples = [];
+let lastInterpolatedWeight = null;
 
 const statusEl = document.getElementById("status");
 const timerDisplayEl = document.getElementById("timerDisplay");
@@ -95,6 +100,7 @@ const timerBtn = document.getElementById("timer");
 const resetTimerBtn = document.getElementById("resetTimer");
 const captureOutputEl = document.getElementById("captureOutput");
 const flowOutputEl = document.getElementById("flowOutput");
+const rawOutputEl = document.getElementById("rawOutput");
 
 /* ---- Acaia/Bookoo UUIDs (Beanconqueror-compatible) ---- */
 const ACAIA_SERVICE_UUID = "00001820-0000-1000-8000-00805f9b34fb";
@@ -195,6 +201,13 @@ function updateFlowOutput() {
   flowOutputEl.value = JSON.stringify(flowCapture);
 }
 
+function updateRawOutput() {
+  rawOutputEl.value = JSON.stringify({
+    startAt: capture.startAt,
+    samples: rawSamples,
+  });
+}
+
 function startCapture() {
   capture = {
     startAt: Date.now(),
@@ -205,8 +218,11 @@ function startCapture() {
     samples: [],
   };
   flowPrevWeight = null;
+  rawSamples = [];
+  lastInterpolatedWeight = null;
   updateCaptureOutput();
   updateFlowOutput();
+  updateRawOutput();
 
   if (captureInterval) {
     clearInterval(captureInterval);
@@ -215,24 +231,32 @@ function startCapture() {
   captureInterval = setInterval(() => {
     if (!capture.startAt) return;
     const elapsedMs = Date.now() - capture.startAt;
+    const targetTime = capture.startAt + elapsedMs;
+    const resampledWeight = getInterpolatedWeight(targetTime);
+
     capture.samples.push({
       tMs: elapsedMs,
-      w: Number.isFinite(lastWeight) ? Number(lastWeight.toFixed(1)) : null,
+      w: Number.isFinite(resampledWeight)
+        ? Number(resampledWeight.toFixed(1))
+        : null,
     });
 
     let flow = null;
-    if (Number.isFinite(lastWeight) && Number.isFinite(flowPrevWeight)) {
-      flow = Number(((lastWeight - flowPrevWeight) * 10).toFixed(2));
+    if (Number.isFinite(resampledWeight) && Number.isFinite(flowPrevWeight)) {
+      flow = Number(((resampledWeight - flowPrevWeight) * 10).toFixed(2));
     }
     flowCapture.samples.push({
       tMs: elapsedMs,
       flow,
     });
-    flowPrevWeight = Number.isFinite(lastWeight) ? lastWeight : flowPrevWeight;
+    flowPrevWeight = Number.isFinite(resampledWeight)
+      ? resampledWeight
+      : flowPrevWeight;
     setFlow(flow);
 
     updateCaptureOutput();
     updateFlowOutput();
+    updateRawOutput();
   }, 100);
 }
 
@@ -243,6 +267,41 @@ function stopCapture() {
   }
   updateCaptureOutput();
   updateFlowOutput();
+}
+
+function addRawSample(weight, timeMs) {
+  rawSamples.push({ t: timeMs, w: weight });
+  if (rawSamples.length > 2000) {
+    rawSamples.splice(0, rawSamples.length - 2000);
+  }
+  updateRawOutput();
+}
+
+function getInterpolatedWeight(targetTime) {
+  if (rawSamples.length === 0) return lastInterpolatedWeight;
+  if (targetTime <= rawSamples[0].t) {
+    lastInterpolatedWeight = rawSamples[0].w;
+    return lastInterpolatedWeight;
+  }
+  if (targetTime >= rawSamples[rawSamples.length - 1].t) {
+    lastInterpolatedWeight = rawSamples[rawSamples.length - 1].w;
+    return lastInterpolatedWeight;
+  }
+
+  let i = 1;
+  while (i < rawSamples.length && rawSamples[i].t < targetTime) {
+    i++;
+  }
+  const prev = rawSamples[i - 1];
+  const next = rawSamples[i];
+  const span = next.t - prev.t;
+  if (span <= 0) {
+    lastInterpolatedWeight = prev.w;
+    return lastInterpolatedWeight;
+  }
+  const ratio = (targetTime - prev.t) / span;
+  lastInterpolatedWeight = prev.w + (next.w - prev.w) * ratio;
+  return lastInterpolatedWeight;
 }
 
 function enqueueWrite(data) {
@@ -511,6 +570,9 @@ function onNotify(event) {
 
   if (weight !== null && Number.isFinite(weight)) {
     setWeight(weight);
+    if (timerRunning) {
+      addRawSample(weight, Date.now());
+    }
     lastPacketAt = Date.now();
   }
 }
@@ -563,8 +625,11 @@ resetTimerBtn.onclick = async () => {
     capture = { startAt: null, samples: [] };
     flowCapture = { startAt: null, samples: [] };
     flowPrevWeight = null;
+    rawSamples = [];
+    lastInterpolatedWeight = null;
     updateCaptureOutput();
     updateFlowOutput();
+    updateRawOutput();
   } catch (err) {
     console.warn("Reset timer failed", err);
   }
