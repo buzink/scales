@@ -13,13 +13,26 @@
     margin: 5px 0;
     padding: 8px 12px;
   }
+  #timerDisplay {
+    font-size: 28px;
+    margin: 20px 0 20px 0;
+  }
   #weight {
     font-size: 48px;
     margin: 20px 0;
   }
+  #flow {
+    font-size: 24px;
+    margin: 0 0 20px 0;
+  }
   #status {
     color: #666;
     font-size: 14px;
+    margin: 0 0 20px 0;
+  }
+  #captureOutput, #flowOutput {
+    font-family: monospace;
+    margin: 0 0 20px 0;
   }
 </style>
 </head>
@@ -32,8 +45,18 @@
 <button id="timer" disabled>Start Timer</button>
 <button id="resetTimer" disabled>Reset Timer</button>
 
+<div id="timerDisplay">0:00</div>
 <div id="weight">--.- g</div>
+
+<div id="flow">--.- g/s</div>
+
 <div id="status">Disconnected</div>
+
+<label for="captureOutput">Weight capture (JSON)</label>
+<textarea id="captureOutput" rows="6" style="width: 100%; margin-top: 6px;" readonly></textarea>
+
+<label for="flowOutput">Flow capture (g/s, JSON)</label>
+<textarea id="flowOutput" rows="6" style="width: 100%; margin-top: 6px;" readonly></textarea>
 
 <script>
 let device;
@@ -47,12 +70,31 @@ let timerRunning = false;
 let acaiaBuffer = new Uint8Array(0);
 let writeQueue = Promise.resolve();
 let writeInProgress = false;
+let lastWeight = null;
+let timerDisplayInterval = null;
+let timerStartAt = null;
+let timerBaseMs = 0;
+
+let capture = {
+  startAt: null,
+  samples: [],
+};
+let captureInterval = null;
+let flowCapture = {
+  startAt: null,
+  samples: [],
+};
+let flowPrevWeight = null;
 
 const statusEl = document.getElementById("status");
+const timerDisplayEl = document.getElementById("timerDisplay");
 const weightEl = document.getElementById("weight");
+const flowEl = document.getElementById("flow");
 const tareBtn = document.getElementById("tare");
 const timerBtn = document.getElementById("timer");
 const resetTimerBtn = document.getElementById("resetTimer");
+const captureOutputEl = document.getElementById("captureOutput");
+const flowOutputEl = document.getElementById("flowOutput");
 
 /* ---- Acaia/Bookoo UUIDs (Beanconqueror-compatible) ---- */
 const ACAIA_SERVICE_UUID = "00001820-0000-1000-8000-00805f9b34fb";
@@ -89,6 +131,118 @@ function setStatus(text) {
 
 function setWeight(value) {
   weightEl.textContent = value.toFixed(1) + " g";
+  lastWeight = value;
+}
+
+function setFlow(value) {
+  if (!Number.isFinite(value)) {
+    flowEl.textContent = "--.- g/s";
+    return;
+  }
+  flowEl.textContent = value.toFixed(2) + " g/s";
+}
+
+function formatTimer(ms) {
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function updateTimerDisplay() {
+  const runningMs = timerStartAt ? Date.now() - timerStartAt : 0;
+  const totalMs = timerBaseMs + runningMs;
+  timerDisplayEl.textContent = formatTimer(totalMs);
+}
+
+function startLocalTimer() {
+  if (!timerStartAt) {
+    timerStartAt = Date.now();
+  }
+  if (!timerDisplayInterval) {
+    timerDisplayInterval = setInterval(updateTimerDisplay, 250);
+  }
+  updateTimerDisplay();
+}
+
+function stopLocalTimer() {
+  if (timerStartAt) {
+    timerBaseMs += Date.now() - timerStartAt;
+    timerStartAt = null;
+  }
+  if (timerDisplayInterval) {
+    clearInterval(timerDisplayInterval);
+    timerDisplayInterval = null;
+  }
+  updateTimerDisplay();
+}
+
+function resetLocalTimer() {
+  timerBaseMs = 0;
+  timerStartAt = null;
+  if (timerDisplayInterval) {
+    clearInterval(timerDisplayInterval);
+    timerDisplayInterval = null;
+  }
+  updateTimerDisplay();
+}
+
+function updateCaptureOutput() {
+  captureOutputEl.value = JSON.stringify(capture);
+}
+
+function updateFlowOutput() {
+  flowOutputEl.value = JSON.stringify(flowCapture);
+}
+
+function startCapture() {
+  capture = {
+    startAt: Date.now(),
+    samples: [],
+  };
+  flowCapture = {
+    startAt: capture.startAt,
+    samples: [],
+  };
+  flowPrevWeight = null;
+  updateCaptureOutput();
+  updateFlowOutput();
+
+  if (captureInterval) {
+    clearInterval(captureInterval);
+  }
+
+  captureInterval = setInterval(() => {
+    if (!capture.startAt) return;
+    const elapsedMs = Date.now() - capture.startAt;
+    capture.samples.push({
+      tMs: elapsedMs,
+      w: Number.isFinite(lastWeight) ? Number(lastWeight.toFixed(1)) : null,
+    });
+
+    let flow = null;
+    if (Number.isFinite(lastWeight) && Number.isFinite(flowPrevWeight)) {
+      flow = Number(((lastWeight - flowPrevWeight) * 10).toFixed(2));
+    }
+    flowCapture.samples.push({
+      tMs: elapsedMs,
+      flow,
+    });
+    flowPrevWeight = Number.isFinite(lastWeight) ? lastWeight : flowPrevWeight;
+    setFlow(flow);
+
+    updateCaptureOutput();
+    updateFlowOutput();
+  }, 100);
+}
+
+function stopCapture() {
+  if (captureInterval) {
+    clearInterval(captureInterval);
+    captureInterval = null;
+  }
+  updateCaptureOutput();
+  updateFlowOutput();
 }
 
 function enqueueWrite(data) {
@@ -185,6 +339,13 @@ function parseAcaiaMessages() {
 function setTimerRunningState(running) {
   timerRunning = running;
   timerBtn.textContent = timerRunning ? "Stop Timer" : "Start Timer";
+  if (timerRunning) {
+    startCapture();
+    startLocalTimer();
+  } else {
+    stopCapture();
+    stopLocalTimer();
+  }
 }
 
 function handleAcaiaTimerEvent(data) {
@@ -254,8 +415,8 @@ document.getElementById("connect").onclick = async () => {
     tareBtn.disabled = false;
     timerBtn.disabled = false;
     resetTimerBtn.disabled = false;
-    timerBtn.textContent = "Start Timer";
-    timerRunning = false;
+    setTimerRunningState(false);
+    resetLocalTimer();
 
   } catch (err) {
     console.error(err);
@@ -378,8 +539,7 @@ timerBtn.onclick = async () => {
       return;
     }
 
-    timerRunning = !timerRunning;
-    timerBtn.textContent = timerRunning ? "Stop Timer" : "Start Timer";
+    setTimerRunningState(!timerRunning);
   } catch (err) {
     console.warn("Timer command failed", err);
   }
@@ -398,8 +558,13 @@ resetTimerBtn.onclick = async () => {
       return;
     }
 
-    timerRunning = false;
-    timerBtn.textContent = "Start Timer";
+    setTimerRunningState(false);
+    resetLocalTimer();
+    capture = { startAt: null, samples: [] };
+    flowCapture = { startAt: null, samples: [] };
+    flowPrevWeight = null;
+    updateCaptureOutput();
+    updateFlowOutput();
   } catch (err) {
     console.warn("Reset timer failed", err);
   }
@@ -411,9 +576,10 @@ function onDisconnected() {
   tareBtn.disabled = true;
   timerBtn.disabled = true;
   resetTimerBtn.disabled = true;
-  timerBtn.textContent = "Start Timer";
-  timerRunning = false;
+  setTimerRunningState(false);
+  resetLocalTimer();
   weightEl.textContent = "--.- g";
+  setFlow(null);
   stopHeartbeat();
 }
 
@@ -441,6 +607,6 @@ function stopHeartbeat() {
   }
 }
 </script>
-<p><a href="https://github.com/buzink/scales">GitHub Repository</a></p>
+<div><p><a href="https://github.com/buzink/scales">GitHub Repository</a></p></div>
 </body>
 </html>
