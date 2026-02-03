@@ -34,6 +34,13 @@
     font-family: monospace;
     margin: 0 0 20px 0;
   }
+  #graph {
+    width: 100%;
+    height: 220px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    margin: 0 0 20px 0;
+  }
 </style>
 </head>
 <body>
@@ -51,6 +58,9 @@
 <div id="flow">--.- g/s</div>
 
 <div id="status">Disconnected</div>
+
+<label for="graph">Realtime graph</label>
+<canvas id="graph"></canvas>
 
 <label for="captureOutput">Weight capture (JSON)</label>
 <textarea id="captureOutput" rows="6" style="width: 100%; margin-top: 6px;" readonly></textarea>
@@ -90,6 +100,8 @@ let flowCapture = {
 let flowPrevWeight = null;
 let rawSamples = [];
 let lastInterpolatedWeight = null;
+let flowHistory = [];
+const FLOW_WINDOW_MS = 2000;
 
 const statusEl = document.getElementById("status");
 const timerDisplayEl = document.getElementById("timerDisplay");
@@ -101,6 +113,7 @@ const resetTimerBtn = document.getElementById("resetTimer");
 const captureOutputEl = document.getElementById("captureOutput");
 const flowOutputEl = document.getElementById("flowOutput");
 const rawOutputEl = document.getElementById("rawOutput");
+const graphEl = document.getElementById("graph");
 
 /* ---- Acaia/Bookoo UUIDs (Beanconqueror-compatible) ---- */
 const ACAIA_SERVICE_UUID = "00001820-0000-1000-8000-00805f9b34fb";
@@ -183,6 +196,17 @@ function stopLocalTimer() {
   updateTimerDisplay();
 }
 
+function pauseLocalTimerDisplay() {
+  if (timerStartAt) {
+    timerBaseMs += Date.now() - timerStartAt;
+    timerStartAt = null;
+  }
+  if (timerDisplayInterval) {
+    clearInterval(timerDisplayInterval);
+    timerDisplayInterval = null;
+  }
+}
+
 function resetLocalTimer() {
   timerBaseMs = 0;
   timerStartAt = null;
@@ -208,6 +232,109 @@ function updateRawOutput() {
   });
 }
 
+function renderGraph() {
+  const ctx = graphEl.getContext("2d");
+  const width = graphEl.clientWidth || 320;
+  const height = graphEl.clientHeight || 220;
+  if (graphEl.width !== width) graphEl.width = width;
+  if (graphEl.height !== height) graphEl.height = height;
+
+  ctx.clearRect(0, 0, width, height);
+
+  const padding = { left: 40, right: 40, top: 20, bottom: 30 };
+  const plotW = width - padding.left - padding.right;
+  const plotH = height - padding.top - padding.bottom;
+
+  const samples = capture.samples;
+  const flowSamples = flowCapture.samples;
+  if (!samples.length && !flowSamples.length) {
+    ctx.fillStyle = "#999";
+    ctx.font = "12px system-ui";
+    ctx.fillText("No data", padding.left, padding.top + 12);
+    return;
+  }
+
+  const allTimes = samples.map((s) => s.tMs).concat(flowSamples.map((s) => s.tMs));
+  const minT = Math.min(...allTimes);
+  const maxT = Math.max(...allTimes);
+  const spanT = Math.max(1, maxT - minT);
+
+  const weightVals = samples.map((s) => s.w).filter((v) => Number.isFinite(v));
+  const flowVals = flowSamples.map((s) => s.flow).filter((v) => Number.isFinite(v));
+
+  let minW = weightVals.length ? Math.min(...weightVals) : 0;
+  let maxW = weightVals.length ? Math.max(...weightVals) : 1;
+  let minF = flowVals.length ? Math.min(...flowVals) : 0;
+  let maxF = flowVals.length ? Math.max(...flowVals) : 1;
+
+  if (minW === maxW) {
+    minW -= 0.5;
+    maxW += 0.5;
+  }
+  if (minF === maxF) {
+    minF -= 0.5;
+    maxF += 0.5;
+  }
+
+  const xFor = (t) => padding.left + ((t - minT) / spanT) * plotW;
+  const yForW = (w) => padding.top + (1 - (w - minW) / (maxW - minW)) * plotH;
+  const yForF = (f) => padding.top + (1 - (f - minF) / (maxF - minF)) * plotH;
+
+  ctx.strokeStyle = "#eee";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(padding.left, padding.top + plotH);
+  ctx.lineTo(padding.left + plotW, padding.top + plotH);
+  ctx.moveTo(padding.left, padding.top);
+  ctx.lineTo(padding.left, padding.top + plotH);
+  ctx.moveTo(padding.left + plotW, padding.top);
+  ctx.lineTo(padding.left + plotW, padding.top + plotH);
+  ctx.stroke();
+
+  ctx.fillStyle = "#666";
+  ctx.font = "12px system-ui";
+  ctx.fillText(`${minW.toFixed(1)} g`, 4, padding.top + plotH);
+  ctx.fillText(`${maxW.toFixed(1)} g`, 4, padding.top + 10);
+  ctx.fillText(`${maxF.toFixed(1)} g/s`, width - 50, padding.top + 10);
+  ctx.fillText(`${minF.toFixed(1)} g/s`, width - 50, padding.top + plotH);
+
+  if (samples.length) {
+    ctx.strokeStyle = "#2563eb";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    samples.forEach((s, i) => {
+      if (!Number.isFinite(s.w)) return;
+      const x = xFor(s.tMs);
+      const y = yForW(s.w);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+
+  if (flowSamples.length) {
+    ctx.strokeStyle = "#16a34a";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    flowSamples.forEach((s, i) => {
+      if (!Number.isFinite(s.flow)) return;
+      const x = xFor(s.tMs);
+      const y = yForF(s.flow);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = "#2563eb";
+  ctx.fillRect(padding.left, height - 18, 10, 2);
+  ctx.fillStyle = "#16a34a";
+  ctx.fillRect(padding.left + 70, height - 18, 10, 2);
+  ctx.fillStyle = "#444";
+  ctx.fillText("Weight", padding.left + 15, height - 14);
+  ctx.fillText("Flow", padding.left + 85, height - 14);
+}
+
 function startCapture() {
   capture = {
     startAt: Date.now(),
@@ -220,9 +347,11 @@ function startCapture() {
   flowPrevWeight = null;
   rawSamples = [];
   lastInterpolatedWeight = null;
+  flowHistory = [];
   updateCaptureOutput();
   updateFlowOutput();
   updateRawOutput();
+  renderGraph();
 
   if (captureInterval) {
     clearInterval(captureInterval);
@@ -242,21 +371,43 @@ function startCapture() {
     });
 
     let flow = null;
-    if (Number.isFinite(resampledWeight) && Number.isFinite(flowPrevWeight)) {
-      flow = Number(((resampledWeight - flowPrevWeight) * 10).toFixed(2));
+    if (Number.isFinite(resampledWeight)) {
+      flowHistory.push({ tMs: elapsedMs, w: resampledWeight });
+      const cutoff = elapsedMs - FLOW_WINDOW_MS;
+      while (flowHistory.length && flowHistory[0].tMs < cutoff) {
+        flowHistory.shift();
+      }
+
+      if (flowHistory.length >= 2) {
+        let sumT = 0;
+        let sumW = 0;
+        let sumTT = 0;
+        let sumTW = 0;
+        for (const p of flowHistory) {
+          const t = p.tMs / 1000;
+          sumT += t;
+          sumW += p.w;
+          sumTT += t * t;
+          sumTW += t * p.w;
+        }
+        const n = flowHistory.length;
+        const denom = n * sumTT - sumT * sumT;
+        if (denom !== 0) {
+          const slope = (n * sumTW - sumT * sumW) / denom;
+          flow = Number(slope.toFixed(2));
+        }
+      }
     }
     flowCapture.samples.push({
       tMs: elapsedMs,
       flow,
     });
-    flowPrevWeight = Number.isFinite(resampledWeight)
-      ? resampledWeight
-      : flowPrevWeight;
     setFlow(flow);
 
     updateCaptureOutput();
     updateFlowOutput();
     updateRawOutput();
+    renderGraph();
   }, 100);
 }
 
@@ -267,6 +418,14 @@ function stopCapture() {
   }
   updateCaptureOutput();
   updateFlowOutput();
+  renderGraph();
+}
+
+function pauseCapture() {
+  if (captureInterval) {
+    clearInterval(captureInterval);
+    captureInterval = null;
+  }
 }
 
 function addRawSample(weight, timeMs) {
@@ -275,6 +434,7 @@ function addRawSample(weight, timeMs) {
     rawSamples.splice(0, rawSamples.length - 2000);
   }
   updateRawOutput();
+  renderGraph();
 }
 
 function getInterpolatedWeight(targetTime) {
@@ -627,9 +787,11 @@ resetTimerBtn.onclick = async () => {
     flowPrevWeight = null;
     rawSamples = [];
     lastInterpolatedWeight = null;
+    flowHistory = [];
     updateCaptureOutput();
     updateFlowOutput();
     updateRawOutput();
+    renderGraph();
   } catch (err) {
     console.warn("Reset timer failed", err);
   }
@@ -641,10 +803,10 @@ function onDisconnected() {
   tareBtn.disabled = true;
   timerBtn.disabled = true;
   resetTimerBtn.disabled = true;
-  setTimerRunningState(false);
-  resetLocalTimer();
-  weightEl.textContent = "--.- g";
-  setFlow(null);
+  timerRunning = false;
+  timerBtn.textContent = "Start Timer";
+  pauseCapture();
+  pauseLocalTimerDisplay();
   stopHeartbeat();
 }
 
